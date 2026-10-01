@@ -1,4 +1,4 @@
-import argparse, time, sys, os
+import argparse, time, sys, os, re, json
 from recorder_reader import RecorderReader
 from read_nodes import read_verifyio_nodes_and_conflicts
 from match_mpi import match_mpi_calls
@@ -16,6 +16,12 @@ class VerifyIO:
         self.show_details = args.show_details       # whether to show violation details
         self.show_full_chain = args.show_full_chain # whether to show full call chain
         self.show_callsite = args.show_callsite     # whether to show source locations of violations
+        self.json_path = args.json                  # write violations grouped by call site to this file
+        self.traces_folder = args.traces_folder
+        self.violation_groups = {}                  # used by --json
+        # per-violation details are only collected when some output needs them
+        self.collect_violations = (self.show_summary or self.show_details or
+                                   self.show_callsite or bool(self.json_path))
         if self.semantics == "Custom":
             self.semantic_string = args.semantic_string # Custom semantics string
         self.reader = None                          # RecorderReader
@@ -199,7 +205,7 @@ def verify_execution_proper_synchronization(conflict_pairs, vio:VerifyIO):
                 and (not verify_pair_proper_synchronization(n2s[rank][0], n1, vio)):
                 total_violations += len(n2s[rank])
                 for n2 in n2s[rank]:
-                    if vio.show_summary or vio.show_details or vio.show_callsite:
+                    if vio.collect_violations:
                         get_violation_info([n1, n2], vio, summary, False)
                     #print(f"{vio.semantics} violation: {n1} {n2}")
                 continue
@@ -212,7 +218,7 @@ def verify_execution_proper_synchronization(conflict_pairs, vio:VerifyIO):
                 this_pair_ok = (verify_pair_proper_synchronization(n1, n2, vio) or \
                                 verify_pair_proper_synchronization(n2, n1, vio))
                 if not this_pair_ok:
-                    if vio.show_summary or vio.show_details or vio.show_callsite:
+                    if vio.collect_violations:
                         get_violation_info([n1, n2], vio, summary, this_pair_ok)
                     total_violations += 1
                     #print(f"{vio.semantics} violation: {n1} {n2}")
@@ -224,6 +230,8 @@ def verify_execution_proper_synchronization(conflict_pairs, vio:VerifyIO):
         print_summary(summary)
     print("Total semantic violations: %d" %total_violations)
     print("Total conflict pairs: %d" %total_conflicts)
+    if vio.json_path:
+        write_json_report(vio, total_violations, total_conflicts)
 
 
 # A helper function to map the mpi edges to a 3D data structure 
@@ -276,8 +284,98 @@ def print_summary(summary):
     print("=" * 80)
     
 
+def get_location(rank, record, reader):
+    """Source location of a record's call site with normalized paths, or None.
+    "a/b/../../c/file.c:12 in f <- ..." -> "c/file.c:12 in f <- ..." """
+    loc = reader.get_callsite(rank, record.call_site)
+    if loc is None:
+        return None
+    frames = []
+    for frame in loc.split(" <- "):
+        path, sep, rest = frame.partition(":")
+        frames.append(os.path.normpath(path) + sep + rest)
+    return " <- ".join(frames)
+
+
+def get_call_stack(node, reader):
+    """Records of the call stack of node, innermost (the I/O call) first:
+    for every call depth, the closest preceding record at that depth."""
+    stack = []
+    seq_id = node.seq_id
+    depth = reader.records[node.rank][seq_id].call_depth
+    while True:
+        r = reader.records[node.rank][seq_id]
+        if r.call_depth <= depth:
+            stack.append(r)
+            depth = r.call_depth - 1
+        if r.call_depth == 0 or seq_id == 0:
+            break
+        seq_id -= 1
+    return stack
+
+
+def access_kind(func):
+    return "write" if "write" in func else "read" if "read" in func else func
+
+
+def site_info(node, reader):
+    """Outermost call (the one the application made) plus the whole chain, for --json."""
+    stack = get_call_stack(node, reader)
+    root = stack[-1]
+    loc = get_location(node.rank, root, reader)
+    info = {"call": reader.funcs[root.func_id], "location": loc,
+            "file": None, "line": None, "function": None}
+    m = re.match(r"^(.*?):(\d+)(?: in (\S+))?", loc or "")
+    if m:
+        info["file"], info["line"], info["function"] = m.group(1), int(m.group(2)), m.group(3)
+    info["chain"] = [{"call": reader.funcs[r.func_id], "location": get_location(node.rank, r, reader)}
+                     for r in reversed(stack)]
+    info["access"] = access_kind(node.func)
+    return info
+
+
+def add_violation_to_groups(nodes, file, vio):
+    """Group violations by the pair of application call sites (order-independent)."""
+    sites = [site_info(n, vio.reader) for n in nodes]
+    keys = [(s["call"], s["location"], s["access"]) for s in sites]
+    if keys[1] < keys[0]:
+        keys.reverse(); sites.reverse(); nodes = nodes[::-1]
+    key = tuple(keys)
+    g = vio.violation_groups.get(key)
+    if g is None:
+        g = vio.violation_groups[key] = {
+            "violations": 0,
+            "kind": "%s-%s" % (sites[0]["access"], sites[1]["access"]),
+            "files": {}, "rank_pairs": {},
+            "site_a": sites[0], "site_b": sites[1],
+            "example": {"rank_a": nodes[0].rank, "seq_a": nodes[0].seq_id,
+                        "rank_b": nodes[1].rank, "seq_b": nodes[1].seq_id},
+        }
+    g["violations"] += 1
+    g["files"][file] = g["files"].get(file, 0) + 1
+    rp = "%d-%d" % (nodes[0].rank, nodes[1].rank)
+    g["rank_pairs"][rp] = g["rank_pairs"].get(rp, 0) + 1
+
+
+def write_json_report(vio, total_violations, total_conflicts):
+    groups = sorted(vio.violation_groups.values(), key=lambda g: -g["violations"])
+    for i, g in enumerate(groups):
+        g["group_id"] = i + 1
+    report = {
+        "trace_dir": os.path.abspath(vio.traces_folder),
+        "semantics": vio.semantics,
+        "algorithm": vio.algorithm,
+        "total_violations": total_violations,
+        "total_conflict_pairs": total_conflicts,
+        "callsites_available": any(g["site_a"]["location"] for g in groups),
+        "groups": groups,
+    }
+    with open(vio.json_path, "w") as f:
+        json.dump(report, f, indent=1)
+
+
 def get_violation_info(nodes: list, vio, summary, this_pair_ok):
-    
+
     def get_call_full_chain(node, reader):
         call_chain = []
         seq_id = node.seq_id
@@ -319,16 +417,7 @@ def get_violation_info(nodes: list, vio, summary, this_pair_ok):
         return "-->".join(reader.funcs[cc.func_id] for cc in call_chain)
 
     def build_callsite_str(rank, record, reader):
-        loc = reader.get_callsite(rank, record.call_site)
-        if loc is None:
-            loc = "unknown call site"
-        else:
-            # "a/b/../../c/file.c:12 in f <- ..." -> "c/file.c:12 in f <- ..."
-            frames = []
-            for frame in loc.split(" <- "):
-                path, sep, rest = frame.partition(":")
-                frames.append(os.path.normpath(path) + sep + rest)
-            loc = " <- ".join(frames)
+        loc = get_location(rank, record, reader) or "unknown call site"
         return f"{reader.funcs[record.func_id]} ({loc})"
 
     left_call_chain = get_call_chain(nodes[0], vio.reader, vio.show_full_chain)
@@ -350,6 +439,8 @@ def get_violation_info(nodes: list, vio, summary, this_pair_ok):
             l_str = build_callsite_str(nodes[0].rank, left_call_chain[-1], vio.reader)
             r_str = build_callsite_str(nodes[1].rank, right_call_chain[-1], vio.reader)
             print(f"Rank {nodes[0].rank}: {l_str} <--> Rank {nodes[1].rank}: {r_str} on file {file}")
+        if vio.json_path:
+            add_violation_to_groups(nodes, file, vio)
 
 
 
@@ -389,6 +480,8 @@ if __name__ == "__main__":
     parser.add_argument("--show_full_chain", action="store_true", help="Show the full call chain of the conflicts")
     parser.add_argument("--show_callsite", action="store_true",
                         help="Show the outermost call of each conflict and its source location (needs a FULL_TRACING trace)")
+    parser.add_argument("--json", type=str, metavar="FILE",
+                        help="Write the violations, grouped by the pair of application call sites, as JSON to FILE")
     args = parser.parse_args()
 
     vio = VerifyIO(args)
